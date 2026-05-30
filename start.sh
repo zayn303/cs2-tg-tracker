@@ -29,3 +29,4 @@ echo "Starting Telegram bot..."
 echo "Press Ctrl+C to stop"
 echo ""
 venv/bin/python tg_bot.py
+

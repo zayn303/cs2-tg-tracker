@@ -1,19 +1,8 @@
-# Credentials — never commit these
 .env
-
-# Python
+inventory.db
 venv/
+plots/
 __pycache__/
 *.pyc
-*.pyo
-
-# Bot data
-inventory.db
-plots/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# AI assistant context 
-CLAUDE.md
+.claude/
+openspec/

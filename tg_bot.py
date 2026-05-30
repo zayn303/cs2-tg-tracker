@@ -8,6 +8,9 @@ import sqlite3
 import requests
 import time
 import urllib.parse
+import json
+import sys
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
 from contextlib import contextmanager
@@ -15,6 +18,8 @@ import threading
 import schedule
 import os
 from dotenv import load_dotenv
+
+sys.setrecursionlimit(5000)
 
 # Try to import matplotlib (optional for charts)
 try:
@@ -33,7 +38,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 DB_PATH = 'inventory.db'
-DELAY = 2.5
+DELAY = 3.5
 STEAM_PRICE_URL = 'https://steamcommunity.com/market/priceoverview/'
 CHARTS_DIR = 'plots'
 MAX_MESSAGE_LENGTH = 3900  # Leave headroom under 4000 char limit
@@ -113,6 +118,7 @@ def init_db():
 def get_exchange_rates() -> Dict[str, float]:
     """Fetch exchange rates (UAH primary) with timeout and error handling."""
     uah_rate = None
+    uah_per_eur = None   # Monobank EUR/UAH rateSell — UAH needed to buy 1 EUR
     source = 'fallback'
 
     # Try monobank
@@ -120,10 +126,13 @@ def get_exchange_rates() -> Dict[str, float]:
         resp = session.get('https://api.monobank.ua/bank/currency', timeout=10)
         resp.raise_for_status()
         for rate in resp.json():
-            if rate.get('currencyCodeA') == 840 and rate.get('currencyCodeB') == 980:
+            codeA = rate.get('currencyCodeA')
+            codeB = rate.get('currencyCodeB')
+            if codeA == 840 and codeB == 980:  # USD/UAH
                 uah_rate = rate.get('rateSell')
                 source = 'monobank'
-                break
+            elif codeA == 978 and codeB == 980:  # EUR/UAH
+                uah_per_eur = rate.get('rateSell')
     except (requests.RequestException, ValueError, KeyError):
         pass
 
@@ -144,18 +153,28 @@ def get_exchange_rates() -> Dict[str, float]:
         uah_rate = 41.5
         source = 'fallback'
 
-    # EUR/USD
-    eur_rate = 0.92
+    # Chain rate: USD→UAH→EUR via mono (realistic Ukrainian cash-out path)
+    chain_eur_per_usd = None
+    if uah_rate and uah_per_eur and uah_per_eur > 0:
+        chain_eur_per_usd = uah_rate / uah_per_eur
+
+    # Market EUR/USD fallback
+    market_eur_per_usd = 0.92
     try:
         resp = session.get('https://open.er-api.com/v6/latest/USD', timeout=10)
         resp.raise_for_status()
-        eur_rate = resp.json().get('rates', {}).get('EUR', 0.92)
+        market_eur_per_usd = resp.json().get('rates', {}).get('EUR', 0.92)
     except (requests.RequestException, ValueError, KeyError):
         pass
 
+    eur_rate = chain_eur_per_usd if chain_eur_per_usd else market_eur_per_usd
+
     return {
         'uah_per_usd': uah_rate,
+        'uah_per_eur': uah_per_eur,
         'eur_per_usd': eur_rate,
+        'chain_eur_per_usd': chain_eur_per_usd,
+        'market_eur_per_usd': market_eur_per_usd,
         'source': source
     }
 
@@ -273,14 +292,12 @@ def set_preferred_currency(currency: str):
 
 
 def generate_chart():
-    """Generate price history chart for preferred currency (memory efficient)."""
+    """Generate price history chart with zoomed-in Y-axis around actual data range."""
     if not MATPLOTLIB_AVAILABLE:
         return None
 
     with get_db() as conn:
         pref_currency = get_preferred_currency(conn)
-
-        # Get historical data (only needed columns)
         cur = conn.cursor()
         cur.execute('SELECT date, total_uah, total_usd, total_eur FROM snapshots ORDER BY date')
         rows = cur.fetchall()
@@ -288,7 +305,6 @@ def generate_chart():
         if not rows or len(rows) < 2:
             return False
 
-    # Currency configuration
     currency_config = {
         'UAH': {'idx': 1, 'color': '#34d399', 'symbol': '₴', 'name': 'UAH'},
         'USD': {'idx': 2, 'color': '#00d4ff', 'symbol': '$', 'name': 'USD'},
@@ -297,9 +313,30 @@ def generate_chart():
 
     config = currency_config.get(pref_currency, currency_config['UAH'])
 
-    # Parse dates and extract values in one pass
-    dates = [datetime.strptime(row[0], '%Y-%m-%d') for row in rows]
+    # Parse dates — handle both 'YYYY-MM-DD' and 'YYYY-MM-DD HH:MM:SS' formats
+    dates = []
+    for row in rows:
+        raw = row[0]
+        try:
+            dates.append(datetime.strptime(raw, '%Y-%m-%d %H:%M:%S'))
+        except ValueError:
+            dates.append(datetime.strptime(raw, '%Y-%m-%d'))
+
     values = [row[config['idx']] for row in rows]
+
+    # --- Zoomed Y-axis: pad 5% above and below the actual data range ---
+    v_min = min(values)
+    v_max = max(values)
+    v_range = v_max - v_min
+
+    # If all values are identical (flat line), add a fixed 2% padding
+    if v_range == 0:
+        padding = v_max * 0.02 if v_max > 0 else 1
+    else:
+        padding = v_range * 0.25  # 25% padding so the line isn't at the very edge
+
+    y_min = v_min - padding
+    y_max = v_max + padding
 
     # Create chart
     plt.style.use('dark_background')
@@ -307,9 +344,11 @@ def generate_chart():
     fig.patch.set_facecolor('#0f0f1a')
     ax.set_facecolor('#0f0f1a')
 
-    # Plot
     ax.plot(dates, values, color=config['color'], linewidth=3, marker='o', markersize=8,
             markerfacecolor=config['color'], markeredgecolor='white', markeredgewidth=1.5)
+
+    # Apply zoomed Y limits
+    ax.set_ylim(y_min, y_max)
 
     # Labels
     ax.set_title(f"Portfolio Value History ({config['name']})",
@@ -333,35 +372,36 @@ def generate_chart():
                         edgecolor=config['color'], linewidth=2),
                arrowprops=dict(arrowstyle='->', color=config['color'], lw=1.5))
 
-    # Calculate and show change
+    # Show overall % change from first to last
     if len(values) > 1:
         first_value = values[0]
-        change_pct = ((latest_value - first_value) / first_value) * 100
-        change_color = '#34d399' if change_pct >= 0 else '#ef4444'
-        change_sign = '+' if change_pct >= 0 else ''
+        if first_value > 0:
+            change_pct = ((latest_value - first_value) / first_value) * 100
+            change_color = '#34d399' if change_pct >= 0 else '#ef4444'
+            change_sign = '+' if change_pct >= 0 else ''
 
-        ax.text(0.02, 0.98, f'{change_sign}{change_pct:.1f}%',
-               transform=ax.transAxes,
-               fontsize=14,
-               fontweight='bold',
-               color=change_color,
-               verticalalignment='top',
-               bbox=dict(boxstyle='round,pad=0.5', facecolor='#0f0f1a',
-                        edgecolor=change_color, linewidth=2))
+            ax.text(0.02, 0.98, f'{change_sign}{change_pct:.1f}%',
+                   transform=ax.transAxes,
+                   fontsize=14,
+                   fontweight='bold',
+                   color=change_color,
+                   verticalalignment='top',
+                   bbox=dict(boxstyle='round,pad=0.5', facecolor='#0f0f1a',
+                            edgecolor=change_color, linewidth=2))
 
     # Format x-axis
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, len(dates)//10)))
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, len(dates) // 10)))
     plt.xticks(rotation=45, ha='right')
 
-    # Fill
-    ax.fill_between(dates, values, alpha=0.2, color=config['color'])
+    # Subtle fill under line (only down to y_min, not zero)
+    ax.fill_between(dates, values, y_min, alpha=0.2, color=config['color'])
 
     plt.tight_layout()
     os.makedirs(CHARTS_DIR, exist_ok=True)
     chart_path = os.path.join(CHARTS_DIR, datetime.now().strftime('%d.%m.%Y-%H:%M') + '.png')
     plt.savefig(chart_path, dpi=120, facecolor='#0f0f1a', edgecolor='none')
-    plt.close(fig)  # Explicitly close to free memory
+    plt.close(fig)
 
     return chart_path
 
@@ -371,9 +411,11 @@ def setup_bot_commands():
     url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands'
     commands = [
         {'command': 'start', 'description': '🏠 Show help'},
+        {'command': 'scan', 'description': '🔍 Import inventory from Steam'},
         {'command': 'add', 'description': '➕ Add item to watchlist'},
         {'command': 'list', 'description': '📋 Show watchlist'},
         {'command': 'remove', 'description': '🗑 Remove item'},
+        {'command': 'report', 'description': '📋 Full report + chart on demand'},
         {'command': 'chart', 'description': '📊 Show price chart'},
         {'command': 'refresh', 'description': '🔄 Update prices now'}
     ]
@@ -443,6 +485,162 @@ def handle_remove(fragment: str):
             send_message(f'❌ No item found matching: {fragment}')
 
 
+def check_steam_up() -> bool:
+    """Return True if Steam Web API is reachable."""
+    try:
+        resp = session.get(
+            'https://api.steampowered.com/ISteamWebAPIUtil/GetServerInfo/v1/',
+            timeout=5
+        )
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def resolve_steam_id(input_str: str) -> Optional[str]:
+    """Return steamid64 string. Accepts steamid64 or vanity name. Returns None on failure."""
+    input_str = input_str.strip()
+    # Already a steamid64 (17-digit number starting with 7656)
+    if input_str.isdigit() and len(input_str) == 17:
+        return input_str
+    # Extract vanity name from full URL if pasted
+    if 'steamcommunity.com/id/' in input_str:
+        input_str = input_str.rstrip('/').split('/id/')[-1].split('/')[0].split('#')[0]
+    try:
+        resp = session.get(
+            f'https://steamcommunity.com/id/{input_str}?xml=1',
+            timeout=10
+        )
+        resp.raise_for_status()
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(resp.text)
+        steamid = root.findtext('steamID64')
+        if steamid and steamid.isdigit():
+            return steamid
+    except (requests.RequestException, ValueError, ET.ParseError):
+        pass
+    return None
+
+
+def handle_scan(steam_input: str):
+    """Fetch public Steam CS2 inventory and bulk-add marketable items to watchlist."""
+    steam_input = steam_input.strip()
+    if not steam_input:
+        send_message('❌ Usage: /scan &lt;steamid64 or vanity name or profile URL&gt;\nExample: /scan zaynplayersteam')
+        return
+
+    if not check_steam_up():
+        send_message('❌ Steam servers appear down. Try again later.')
+        return
+
+    steam_id = resolve_steam_id(steam_input)
+    if not steam_id:
+        send_message(f'❌ Could not resolve <code>{steam_input}</code> to a Steam ID. Check the name/URL.')
+        return
+
+    send_message(f'🔍 Scanning inventory for <code>{steam_id}</code>...')
+
+    inv_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': 'https://steamcommunity.com/my/inventory/',
+        'Origin': 'https://steamcommunity.com',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    inv_url = f'https://steamcommunity.com/inventory/{steam_id}/730/2'
+
+    all_assets = []
+    all_descriptions = []
+    start_assetid = None
+
+    while True:
+        params = {'l': 'english', 'count': 2000}
+        if start_assetid:
+            params['start_assetid'] = start_assetid
+
+        page_data = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = session.get(inv_url, params=params, headers=inv_headers, timeout=15)
+                if resp.status_code == 403:
+                    send_message('❌ Inventory is private. Set Steam → Privacy Settings → Inventory → Public.')
+                    return
+                if resp.status_code == 429:
+                    last_error = 'rate limited'
+                    if attempt < 2:
+                        time.sleep(5)
+                    continue
+                if resp.status_code != 200:
+                    last_error = f'HTTP {resp.status_code}'
+                    if attempt < 2:
+                        time.sleep(5)
+                    continue
+                page_data = resp.json()
+                if page_data:
+                    break
+                last_error = 'empty response'
+            except (requests.RequestException, ValueError) as e:
+                last_error = str(e)
+            if attempt < 2:
+                time.sleep(5)
+
+        if not page_data or not page_data.get('success'):
+            msg = f'last error: {last_error}' if last_error else 'inventory may be private'
+            send_message(f'❌ Failed after 3 attempts ({msg}).')
+            return
+
+        all_assets.extend(page_data.get('assets', []))
+        all_descriptions.extend(page_data.get('descriptions', []))
+
+        if page_data.get('more_items') and page_data.get('last_assetid'):
+            start_assetid = page_data['last_assetid']
+            time.sleep(1)
+        else:
+            break
+
+    desc_map = {}
+    for d in all_descriptions:
+        if d.get('marketable') == 1:
+            desc_map[d['classid']] = d['market_hash_name']
+
+    counts: Dict[str, int] = {}
+    for asset in all_assets:
+        name = desc_map.get(asset.get('classid'))
+        if name:
+            counts[name] = counts.get(name, 0) + int(asset.get('amount', 1))
+
+    if not counts:
+        send_message('📭 No marketable CS2 items found in inventory.')
+        return
+
+    added = updated = 0
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        cur = conn.cursor()
+        for name, qty in counts.items():
+            try:
+                cur.execute('INSERT INTO watchlist (name, qty, added_at) VALUES (?, ?, ?)',
+                            (name, qty, now))
+                added += 1
+            except sqlite3.IntegrityError:
+                cur.execute('UPDATE watchlist SET qty = ? WHERE name = ?', (qty, name))
+                updated += 1
+        conn.commit()
+
+    lines = [f'✅ Scan complete: {added} added, {updated} updated\n']
+    for name, qty in sorted(counts.items()):
+        lines.append(f'• {qty}× {name}')
+    # Telegram 4096 char limit — split if needed
+    chunk = ''
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 4000:
+            send_message(chunk)
+            chunk = ''
+        chunk += line + '\n'
+    if chunk:
+        send_message(chunk)
+
+
 def handle_list():
     """Show watchlist with action buttons."""
     with get_db() as conn:
@@ -461,7 +659,8 @@ def handle_list():
         keyboard = {
             'inline_keyboard': [
                 [
-                    {'text': '📊 Show Chart', 'callback_data': 'chart'},
+                    {'text': '📋 Report', 'callback_data': 'report'},
+                    {'text': '📊 Chart', 'callback_data': 'chart'},
                     {'text': '🔄 Refresh', 'callback_data': 'refresh'}
                 ],
                 [
@@ -477,17 +676,34 @@ def handle_list():
 
 
 def handle_refresh():
-    """Trigger immediate price update."""
+    """Trigger immediate price update and persist to DB as a new snapshot."""
     send_message('🔄 Starting price update...')
     daily_update()
 
 
+def handle_report():
+    """On-demand full report: fetch prices + summary + chart."""
+    send_message('📋 Generating full report...')
+    daily_update()
+    result = generate_chart()
+    if result is None:
+        pass  # matplotlib unavailable; daily_update already sent text report
+    elif result:
+        send_photo(result, '📊 Portfolio Chart')
+    # result == False means <2 data points — shouldn't happen after daily_update just inserted
+
+
 def calculate_change(current: float, days_ago: int, date_today: str) -> Optional[float]:
-    """Calculate percentage change efficiently."""
+    """Find closest snapshot at or before N days ago and calculate % change."""
     with get_db() as conn:
         cur = conn.cursor()
-        target_date = (datetime.strptime(date_today, '%Y-%m-%d') - timedelta(days=days_ago)).strftime('%Y-%m-%d')
-        cur.execute('SELECT total_uah FROM snapshots WHERE date = ? LIMIT 1', (target_date,))
+        cutoff = (datetime.strptime(date_today, '%Y-%m-%d') - timedelta(days=days_ago)).strftime('%Y-%m-%d')
+        cur.execute('''
+            SELECT total_uah FROM snapshots
+            WHERE date <= ?
+            ORDER BY date DESC
+            LIMIT 1
+        ''', (cutoff + ' 23:59:59',))
         row = cur.fetchone()
 
     if row and row[0] and row[0] > 0:
@@ -504,9 +720,71 @@ def format_change(change: Optional[float]) -> str:
     return f'{emoji} {sign}{change:.1f}%'
 
 
+def build_items_report(item_data: list, date_today: str) -> str:
+    """Build the detailed items list with 24h/7d/30d per-item % changes."""
+    lines = ['🏷 <b>Items by total value</b>']
+
+    sorted_items = sorted(item_data, key=lambda x: x['price_uah'] * x['qty'], reverse=True)
+
+    for item in sorted_items:
+        if item['price_usd'] <= 0:
+            continue
+
+        name = item['name']
+        qty = item['qty']
+        uah = item['price_uah']
+        usd = item['price_usd']
+        eur = item['price_eur']
+
+        def item_change(days):
+            cutoff = (datetime.strptime(date_today, '%Y-%m-%d') - timedelta(days=days)).strftime('%Y-%m-%d')
+            with get_db() as conn:
+                cur = conn.cursor()
+                cur.execute('''
+                    SELECT price_uah FROM item_prices
+                    WHERE name = ? AND date <= ?
+                    ORDER BY date DESC LIMIT 1
+                ''', (name, cutoff + ' 23:59:59'))
+                row = cur.fetchone()
+            if row and row[0] and row[0] > 0:
+                return ((uah - row[0]) / row[0]) * 100
+            return None
+
+        c24 = format_change(item_change(1))
+        c7  = format_change(item_change(7))
+        c30 = format_change(item_change(30))
+
+        unit_line = f"  ₴{uah:.2f} / ${usd:.2f} / €{eur:.2f}"
+
+        if qty > 1:
+            total_uah_i = uah * qty
+            total_usd_i = usd * qty
+            total_eur_i = eur * qty
+            lines.extend([
+                '',
+                f"• {qty}× {name}",
+                f"{unit_line} ea.",
+                f"  = ₴{total_uah_i:,.2f} / ${total_usd_i:,.2f} / €{total_eur_i:,.2f}",
+                f"  24h: {c24}  7d: {c7}  30d: {c30}"
+            ])
+        else:
+            lines.extend([
+                '',
+                f"• {name}",
+                unit_line,
+                f"  24h: {c24}  7d: {c7}  30d: {c30}"
+            ])
+
+    return '\n'.join(lines)
+
+
 def daily_update():
-    """Daily price update job (optimized)."""
+    """Daily price update — always inserts a new snapshot row (datetime key)."""
     print(f'▶ Starting daily update at {datetime.now(timezone.utc).isoformat()}')
+
+    if not check_steam_up():
+        print('⚠️ Steam API unreachable, skipping update')
+        return
 
     with get_db() as conn:
         cur = conn.cursor()
@@ -519,16 +797,23 @@ def daily_update():
 
         print(f'📊 Fetching prices for {len(watchlist)} items')
 
-        # Get exchange rates
         rates = get_exchange_rates()
         print(f"💱 Rates: 1 USD = ₴{rates['uah_per_usd']:.2f} ({rates['source']})")
 
-        # Fetch prices
         item_data = []
         for i, (name, qty) in enumerate(watchlist, 1):
             print(f'[{i}/{len(watchlist)}] {qty}× {name}')
-            price_usd = get_current_price(name) or 0.0
-
+            price_usd = get_current_price(name)
+            if price_usd is None:
+                # Fall back to last known good price
+                cur.execute(
+                    'SELECT price_usd FROM item_prices WHERE name=? AND price_usd > 0 ORDER BY date DESC LIMIT 1',
+                    (name,)
+                )
+                row = cur.fetchone()
+                price_usd = row[0] if row else 0.0
+                if price_usd:
+                    print(f'  ⚠️ Using cached price ${price_usd:.4f} for {name}')
             item_data.append({
                 'name': name,
                 'qty': qty,
@@ -536,38 +821,55 @@ def daily_update():
                 'price_uah': price_usd * rates['uah_per_usd'],
                 'price_eur': price_usd * rates['eur_per_usd']
             })
-
             time.sleep(DELAY)
 
-        # Calculate totals
+        # Use full datetime as key so every refresh is a distinct row
         date_today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        datetime_now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
         total_uah = sum(item['price_uah'] * item['qty'] for item in item_data)
         total_usd = sum(item['price_usd'] * item['qty'] for item in item_data)
         total_eur = sum(item['price_eur'] * item['qty'] for item in item_data)
         total_items = sum(item['qty'] for item in item_data)
 
-        # Save to DB
+        if total_usd == 0:
+            print('⚠️ All prices returned 0 — likely network failure. Skipping snapshot.')
+            send_message('⚠️ Price update skipped — all items returned $0 (network unreachable?)')
+            return
+
+        # INSERT (not REPLACE) so every refresh is stored separately
         cur.execute('''
-            INSERT OR REPLACE INTO snapshots (date, total_uah, total_usd, total_eur, item_count)
+            INSERT INTO snapshots (date, total_uah, total_usd, total_eur, item_count)
             VALUES (?, ?, ?, ?, ?)
-        ''', (date_today, total_uah, total_usd, total_eur, total_items))
+        ''', (datetime_now, total_uah, total_usd, total_eur, total_items))
 
         for item in item_data:
             cur.execute('''
-                INSERT OR REPLACE INTO item_prices (date, name, qty, price_uah, price_usd, price_eur)
+                INSERT INTO item_prices (date, name, qty, price_uah, price_usd, price_eur)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', (date_today, item['name'], item['qty'], item['price_uah'], item['price_usd'], item['price_eur']))
+            ''', (datetime_now, item['name'], item['qty'],
+                  item['price_uah'], item['price_usd'], item['price_eur']))
 
         conn.commit()
 
-    # Calculate changes
     change_24h = calculate_change(total_uah, 1, date_today)
-    change_7d = calculate_change(total_uah, 7, date_today)
+    change_7d  = calculate_change(total_uah, 7, date_today)
     change_30d = calculate_change(total_uah, 30, date_today)
 
-    # Build report (efficient string building)
-    report_parts = [
-        f'📊 <b>Market Report</b>',
+    # Build EUR conversion advisory line
+    chain_eur = rates.get('chain_eur_per_usd')
+    market_eur = rates['market_eur_per_usd']
+    if chain_eur:
+        spread = (chain_eur - market_eur) / market_eur * 100
+        spread_emoji = '🟢' if spread >= -1.5 else ('🟡' if spread >= -3.0 else '🔴')
+        eur_line = (f"💶 USD→EUR: €{chain_eur:.4f} chain / €{market_eur:.4f} mkt  "
+                    f"{spread_emoji} {spread:+.2f}%")
+    else:
+        eur_line = f"💶 USD→EUR: €{market_eur:.4f} (mkt only)"
+
+    # Compact summary only
+    summary = '\n'.join([
+        '📊 <b>Market Report</b>',
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC",
         f'📋 {total_items} items ({len(item_data)} unique)',
         '',
@@ -578,56 +880,35 @@ def daily_update():
         '',
         '📈 <b>Portfolio changes</b>',
         f'   24h: {format_change(change_24h)}',
-        f'   7d: {format_change(change_7d)}',
+        f'   7d:  {format_change(change_7d)}',
         f'   30d: {format_change(change_30d)}',
         '',
-        f"💱 Rates: 1 USD = ₴{rates['uah_per_usd']:.2f} ({rates['source']}) | €{rates['eur_per_usd']:.4f}",
-        '',
-        '🏷 <b>Items by total value</b>'
-    ]
+        f"💱 UAH: ₴{rates['uah_per_usd']:.2f}/USD ({rates['source']})",
+        eur_line,
+    ])
 
-    # Add items sorted by total value
-    sorted_items = sorted(item_data, key=lambda x: x['price_uah'] * x['qty'], reverse=True)
-
-    for item in sorted_items:
-        if item['price_usd'] > 0:
-            unit_line = f"  ₴{item['price_uah']:.2f} / ${item['price_usd']:.2f} / €{item['price_eur']:.2f}"
-
-            if item['qty'] > 1:
-                total_uah_item = item['price_uah'] * item['qty']
-                total_usd_item = item['price_usd'] * item['qty']
-                total_eur_item = item['price_eur'] * item['qty']
-                report_parts.extend([
-                    '',
-                    f"• {item['qty']}× {item['name']}",
-                    f"{unit_line} ea.",
-                    f"  = ₴{total_uah_item:,.2f} / ${total_usd_item:,.2f} / €{total_eur_item:,.2f}"
-                ])
-            else:
-                report_parts.extend([
-                    '',
-                    f"• {item['name']}",
-                    unit_line
-                ])
-
-    report = '\n'.join(report_parts)
-
-    # Add action buttons
     keyboard = {
-        'inline_keyboard': [
-            [
-                {'text': '📊 Show Chart', 'callback_data': 'chart'},
-                {'text': '📋 View List', 'callback_data': 'list_cmd'}
-            ]
-        ]
+        'inline_keyboard': [[
+            {'text': '🏷 Show Items', 'callback_data': 'items_detail'},
+            {'text': '📊 Chart',      'callback_data': 'chart'},
+            {'text': '🔄 Refresh',    'callback_data': 'refresh'}
+        ]]
     }
 
-    send_message(report, reply_markup=keyboard)
+    send_message(summary, reply_markup=keyboard)
+
+    # Cache item_data for the Show Items callback
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                   ('last_item_data', json.dumps({'date': date_today, 'items': item_data})))
+        conn.commit()
+
     print('✅ Daily update complete')
 
 
 def process_updates():
-    """Long-polling for Telegram updates (optimized)."""
+    """Long-polling for Telegram updates."""
     print('🚀 Starting Telegram bot...')
     offset = 0
 
@@ -645,7 +926,7 @@ def process_updates():
 
             data = resp.json()
             if not data.get('ok'):
-                print(f'⚠️ getUpdates not ok')
+                print('⚠️ getUpdates not ok')
                 time.sleep(5)
                 continue
 
@@ -660,7 +941,6 @@ def process_updates():
                     callback_data = callback_query.get('data', '')
                     query_id = callback_query.get('id')
 
-                    # Answer callback
                     session.post(
                         f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery',
                         json={'callback_query_id': query_id},
@@ -681,8 +961,23 @@ def process_updates():
                     elif callback_data == 'refresh':
                         handle_refresh()
 
+                    elif callback_data == 'report':
+                        handle_report()
+
                     elif callback_data == 'list_cmd':
                         handle_list()
+
+                    elif callback_data == 'items_detail':
+                        with get_db() as conn:
+                            cur = conn.cursor()
+                            cur.execute("SELECT value FROM settings WHERE key = 'last_item_data'")
+                            row = cur.fetchone()
+                        if row:
+                            cached = json.loads(row[0])
+                            report = build_items_report(cached['items'], cached['date'])
+                            send_message(report)
+                        else:
+                            send_message('❌ No item data cached yet. Try /refresh first.')
 
                     elif callback_data.startswith('curr_'):
                         currency = callback_data.split('_')[1]
@@ -701,8 +996,9 @@ def process_updates():
 
                 print(f'💬 Command: {text}')
 
-                # Handle commands
-                if text.startswith('/add '):
+                if text.startswith('/scan ') or text == '/scan':
+                    handle_scan(text[6:].strip() if text.startswith('/scan ') else '')
+                elif text.startswith('/add '):
                     handle_add(text[5:].strip())
                 elif text.startswith('/remove '):
                     handle_remove(text[8:].strip())
@@ -718,20 +1014,25 @@ def process_updates():
                         send_message('❌ Not enough data to generate chart (need at least 2 days)')
                 elif text == '/refresh':
                     handle_refresh()
-                elif text == '/start' or text == '/help':
+                elif text == '/report':
+                    handle_report()
+                elif text in ('/start', '/help'):
                     help_msg = '''🤖 <b>Market Tracker Bot</b>
 
 <b>Commands:</b>
+/report - Full report + chart on demand
+/scan &lt;steamid64&gt; - Import inventory from Steam
 /add &lt;url&gt; [qty] - Add item to watchlist
 /remove &lt;name&gt; - Remove item
 /list - Show watchlist with buttons
 /chart - Show price history chart
-/refresh - Update prices now
+/refresh - Update prices (no chart)
 
 <b>Interactive Buttons:</b>
 Use /list to see buttons for:
-• 📊 Chart - View price history
-• 🔄 Refresh - Update prices
+• 📋 Report - Full report + chart
+• 📊 Chart - View price history only
+• 🔄 Refresh - Update prices only
 • 💱 Currency - Set preferred currency (UAH/USD/EUR)
 
 <b>Examples:</b>
@@ -742,8 +1043,8 @@ Use /list to see buttons for:
 Daily reports sent automatically at 09:00 UTC.'''
                     reply_keyboard = {
                         'keyboard': [
-                            [{'text': '/list'}, {'text': '/chart'}],
-                            [{'text': '/refresh'}, {'text': '/add'}]
+                            [{'text': '/report'}, {'text': '/chart'}],
+                            [{'text': '/list'}, {'text': '/refresh'}, {'text': '/add'}]
                         ],
                         'resize_keyboard': True,
                         'persistent': True
@@ -755,6 +1056,7 @@ Daily reports sent automatically at 09:00 UTC.'''
             time.sleep(5)
         except Exception as e:
             print(f'⚠️ Error in bot loop: {e}')
+            traceback.print_exc()
             time.sleep(5)
 
 
@@ -773,20 +1075,15 @@ def main():
         print('❌ ERROR: Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables')
         return
 
-    # Initialize
     init_db()
     setup_bot_commands()
 
-    # Schedule daily update
     schedule.every().day.at('09:00').do(daily_update)
 
-    # Start scheduler in background
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
 
     print('✅ Bot ready! Daily updates at 09:00 UTC')
-
-    # Start polling
     process_updates()
 
 
