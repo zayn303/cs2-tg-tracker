@@ -1,8 +1,8 @@
-from typing import Dict
+from typing import Any, Dict
 from .config import session
 
 
-def get_exchange_rates() -> Dict[str, float]:
+def get_exchange_rates() -> Dict[str, Any]:
     uah_rate = None
     uah_per_eur = None
     source = 'fallback'
