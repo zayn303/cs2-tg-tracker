@@ -64,6 +64,7 @@ def setup_bot_commands():
         {'command': 'list',    'description': '📋 Show watchlist'},
         {'command': 'remove',  'description': '🗑 Remove item'},
         {'command': 'report',  'description': '📋 Full report + chart on demand'},
+        {'command': 'rates',   'description': '💱 Current exchange rates (USD/UAH/EUR)'},
         {'command': 'chart',   'description': '📊 Show price chart'},
         {'command': 'refresh', 'description': '🔄 Update prices now'}
     ]

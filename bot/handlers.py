@@ -8,6 +8,7 @@ from .telegram import send_message, send_photo
 from .steam import get_current_price, check_steam_up, resolve_steam_id
 from .reports import build_items_report
 from .charts import generate_chart, MATPLOTLIB_AVAILABLE
+from .currency import get_exchange_rates
 from .scheduler import daily_update
 
 
@@ -88,9 +89,10 @@ def handle_list():
                     {'text': '🔄 Refresh', 'callback_data': 'refresh'}
                 ],
                 [
-                    {'text': '💱 UAH', 'callback_data': 'curr_UAH'},
-                    {'text': '💱 USD', 'callback_data': 'curr_USD'},
-                    {'text': '💱 EUR', 'callback_data': 'curr_EUR'}
+                    {'text': '💱 Rates', 'callback_data': 'rates'},
+                    {'text': 'UAH', 'callback_data': 'curr_UAH'},
+                    {'text': 'USD', 'callback_data': 'curr_USD'},
+                    {'text': 'EUR', 'callback_data': 'curr_EUR'}
                 ]
             ]
         }
@@ -230,3 +232,40 @@ def handle_report():
         pass
     elif result:
         send_photo(result, '📊 Portfolio Chart')
+
+
+def handle_rates():
+    rates = get_exchange_rates()
+
+    uah = rates['uah_per_usd']
+    market_eur = rates['market_eur_per_usd']
+    chain_eur = rates.get('chain_eur_per_usd')
+    source = rates['source']
+
+    usd_to_uah = f'₴{uah:.2f}'
+    usd_to_eur_market = f'€{market_eur:.4f}'
+
+    lines = [
+        '💱 <b>Exchange Rates</b>',
+        f'🕐 {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")} UTC',
+        f'📡 Source: {source}',
+        '',
+        f'<b>1 USD → UAH:</b> {usd_to_uah}',
+        f'<b>1 USD → EUR:</b> {usd_to_eur_market} (market / er-api)',
+    ]
+
+    if chain_eur:
+        uah_per_eur = rates.get('uah_per_eur')
+        spread = (chain_eur - market_eur) / market_eur * 100
+        spread_emoji = '🟢' if spread >= -1.5 else ('🟡' if spread >= -3.0 else '🔴')
+        lines.append(f'<b>1 USD → EUR:</b> €{chain_eur:.4f} (UAH chain) {spread_emoji} {spread:+.2f}% vs market')
+        if uah_per_eur:
+            lines.append(f'<b>1 EUR → UAH:</b> ₴{uah_per_eur:.2f}')
+
+    lines += [
+        '',
+        '💡 UAH chain = convert USD→UAH→EUR via mono sell rates',
+        '   (realistic Ukrainian cash-out path)',
+    ]
+
+    send_message('\n'.join(lines))

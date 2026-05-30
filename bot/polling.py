@@ -9,7 +9,7 @@ from .db import init_db, get_db, set_preferred_currency
 from .telegram import send_message, send_photo, setup_bot_commands
 from .charts import generate_chart, MATPLOTLIB_AVAILABLE
 from .reports import build_items_report
-from .handlers import handle_add, handle_remove, handle_list, handle_scan, handle_refresh, handle_report
+from .handlers import handle_add, handle_remove, handle_list, handle_scan, handle_refresh, handle_report, handle_rates
 from .scheduler import daily_update, run_scheduler
 
 
@@ -66,6 +66,9 @@ def process_updates():
                     elif callback_data == 'report':
                         handle_report()
 
+                    elif callback_data == 'rates':
+                        handle_rates()
+
                     elif callback_data == 'list_cmd':
                         handle_list()
 
@@ -117,11 +120,14 @@ def process_updates():
                     handle_refresh()
                 elif text == '/report':
                     handle_report()
+                elif text == '/rates':
+                    handle_rates()
                 elif text in ('/start', '/help'):
                     help_msg = '''🤖 <b>Market Tracker Bot</b>
 
 <b>Commands:</b>
 /report - Full report + chart on demand
+/rates - Current exchange rates (USD/UAH/EUR)
 /scan &lt;steamid64&gt; - Import inventory from Steam
 /add &lt;url&gt; [qty] - Add item to watchlist
 /remove &lt;name&gt; - Remove item
@@ -134,6 +140,7 @@ Use /list to see buttons for:
 • 📋 Report - Full report + chart
 • 📊 Chart - View price history only
 • 🔄 Refresh - Update prices only
+• 💱 Rates - Live exchange rates
 • 💱 Currency - Set preferred currency (UAH/USD/EUR)
 
 <b>Examples:</b>
@@ -144,7 +151,7 @@ Use /list to see buttons for:
 Daily reports sent automatically at 09:00 UTC.'''
                     reply_keyboard = {
                         'keyboard': [
-                            [{'text': '/report'}, {'text': '/chart'}],
+                            [{'text': '/report'}, {'text': '/chart'}, {'text': '/rates'}],
                             [{'text': '/list'}, {'text': '/refresh'}, {'text': '/add'}]
                         ],
                         'resize_keyboard': True,

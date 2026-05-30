@@ -117,6 +117,7 @@ def daily_update():
         'inline_keyboard': [[
             {'text': '🏷 Show Items', 'callback_data': 'items_detail'},
             {'text': '📊 Chart',      'callback_data': 'chart'},
+            {'text': '💱 Rates',      'callback_data': 'rates'},
             {'text': '🔄 Refresh',    'callback_data': 'refresh'}
         ]]
     }
