@@ -7,7 +7,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 DB_PATH = 'inventory.db'
-DELAY = 3.5
+DELAY = 5.0  # ~12 req/min — comfortable below Steam's ~20/min limit
 STEAM_PRICE_URL = 'https://steamcommunity.com/market/priceoverview/'
 CHARTS_DIR = 'plots'
 MAX_MESSAGE_LENGTH = 3900

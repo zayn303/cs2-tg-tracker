@@ -32,10 +32,20 @@ def daily_update():
         print(f"💱 Rates: 1 USD = ₴{rates['uah_per_usd']:.2f} ({rates['source']})")
 
         item_data = []
+        current_delay = DELAY
+        consecutive_failures = 0
+
         for i, (name, qty) in enumerate(watchlist, 1):
             print(f'[{i}/{len(watchlist)}] {qty}× {name}')
-            price_usd = get_current_price(name)
+            price_usd, was_rate_limited = get_current_price(name)
+
+            if was_rate_limited:
+                # After a 429 mid-run, back off inter-item delay for the rest of the run
+                current_delay = max(current_delay, 8.0)
+                print(f'  ℹ️ Rate limited during fetch — inter-item delay increased to {current_delay}s')
+
             if price_usd is None:
+                consecutive_failures += 1
                 cur.execute(
                     'SELECT price_usd FROM item_prices WHERE name=? AND price_usd > 0 ORDER BY date DESC LIMIT 1',
                     (name,)
@@ -44,6 +54,16 @@ def daily_update():
                 price_usd = row[0] if row else 0.0
                 if price_usd:
                     print(f'  ⚠️ Using cached price ${price_usd:.4f} for {name}')
+
+                # 2+ consecutive failures likely means Steam is throttling hard — pause 90s
+                if consecutive_failures >= 2:
+                    print(f'  ⏸ {consecutive_failures} consecutive failures — pausing 90s to let Steam cool down')
+                    time.sleep(90)
+                    consecutive_failures = 0
+                    current_delay = max(current_delay, 8.0)
+            else:
+                consecutive_failures = 0
+
             item_data.append({
                 'name': name,
                 'qty': qty,
@@ -51,7 +71,7 @@ def daily_update():
                 'price_uah': price_usd * rates['uah_per_usd'],
                 'price_eur': price_usd * rates['eur_per_usd']
             })
-            time.sleep(DELAY)
+            time.sleep(current_delay)
 
         date_today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         datetime_now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
